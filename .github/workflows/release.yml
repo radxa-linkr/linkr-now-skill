@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Test protocols and launchers
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Check release version
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
+          [[ "$(cat VERSION)" == "$RELEASE_TAG" ]]
+
+      - name: Build release packages
+        run: go run ./tools/package.go --version "$RELEASE_TAG"
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          [[ "$(bin/linux-amd64/linkr-now --version)" == "linkr-now $RELEASE_TAG" ]]
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          version = os.environ["RELEASE_TAG"]
+          common = {"SKILL.md", "agents/openai.yaml", "references/usage.md", "LICENSE",
+                    "THIRD_PARTY_NOTICES.txt", "VERSION", "scripts/linkr-now.sh",
+                    "scripts/linkr-now.ps1"}
+          for name in ("LICENSE", "THIRD_PARTY_NOTICES.txt"):
+              assert Path("dist", name).read_bytes() == Path(name).read_bytes()
+          for platform in ("linux-amd64", "linux-arm64", "darwin-amd64",
+                           "darwin-arm64", "windows-amd64", "windows-arm64"):
+              suffix = ".exe" if platform.startswith("windows-") else ""
+              binary = f"bin/{platform}/linkr-now{suffix}"
+              standalone = Path(f"dist/linkr-now-{version}-{platform}{suffix}")
+              with ZipFile(f"dist/linkr-now-skill-{version}-{platform}.zip") as package:
+                  expected = {f"linkr-now-skill/{name}" for name in common | {binary}}
+                  assert len(package.namelist()) == len(expected)
+                  assert set(package.namelist()) == expected
+                  assert package.testzip() is None
+                  for name in common:
+                      assert package.read(f"linkr-now-skill/{name}") == Path(name).read_bytes()
+                  assert package.read(f"linkr-now-skill/{binary}") == standalone.read_bytes()
+                  assert package.getinfo(f"linkr-now-skill/{binary}").external_attr >> 16 & 0o111
+          PY
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Download the skill ZIP matching your operating system and processor from Assets, then extract the `linkr-now-skill` folder into your assistant's skills directory. Each platform ZIP includes its executable and works without Python, Go, or a first-run download.
+
+          The standalone executables support automatic setup when installing the skill from this repository. `LICENSE` and `THIRD_PARTY_NOTICES.txt` accompany them. `SHA256SUMS` covers the ZIP packages, standalone executables, and license files.
+
+          GitHub's automatically generated Source code archives do not include executables. See the README for installation and usage.
+          NOTES
+          assets=(dist/SHA256SUMS dist/LICENSE dist/THIRD_PARTY_NOTICES.txt)
+          for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64; do
+            suffix=''
+            if [[ "$platform" == windows-* ]]; then suffix='.exe'; fi
+            assets+=("dist/linkr-now-skill-$RELEASE_TAG-$platform.zip")
+            assets+=("dist/linkr-now-$RELEASE_TAG-$platform$suffix")
+          done
+          flags=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "Linkr.now Skill $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md")
+          if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" "${assets[@]}" "${flags[@]}"

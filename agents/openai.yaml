@@ -1,0 +1,4 @@
+interface:
+  display_name: "Linkr.now Skill"
+  short_description: "Find and monitor Linkr devices without a browser"
+  default_prompt: "Use $linkr-now-skill to discover accessible Linkr devices and report their addresses, connection sources, and current status."
